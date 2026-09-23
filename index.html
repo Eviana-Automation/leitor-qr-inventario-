@@ -84,6 +84,14 @@
       <button id="btnFoto">Tirar foto</button>
     </div>
     <input type="file" accept="image/*" capture="environment" id="arquivo" style="display:none">
+    <div id="ctrlCam" style="display:none;margin-top:11px">
+      <select id="selCam" style="display:none;width:100%;font:inherit;padding:9px 10px;border-radius:9px;border:1px solid var(--line);background:var(--bg);color:var(--fg)"></select>
+      <div id="zoomWrap" style="display:none;margin-top:9px">
+        <label for="zoom" style="margin:0 0 4px">Zoom <span id="zoomVal"></span></label>
+        <input type="range" id="zoom" style="width:100%;accent-color:var(--accent)">
+      </div>
+      <p class="hint" style="margin-top:7px">Se nao focar de perto, afaste uns 20 cm e aumente o zoom.</p>
+    </div>
     <div class="auto">
       <input type="checkbox" id="chkAuto" checked>
       <label for="chkAuto" style="margin:0;text-transform:none;letter-spacing:0;font-size:13.5px;font-weight:500;color:var(--fg)">Adicionar sozinho ao ler (não precisa tocar na tela)</label>
@@ -229,21 +237,82 @@
   }
 
   /* câmera */
+  var track=null, alterna=0;
+
   function paraCam(){
     running=false;
     if(stream){ stream.getTracks().forEach(function(t){t.stop();}); stream=null; }
+    track=null;
     camwrap.className='camwrap'; $('btnCam').textContent='Ligar câmera';
+    $('ctrlCam').style.display='none';
   }
-  function ligaCam(){
+
+  function listaCameras(){
+    if(!navigator.mediaDevices||!navigator.mediaDevices.enumerateDevices) return;
+    navigator.mediaDevices.enumerateDevices().then(function(ds){
+      var cams=ds.filter(function(d){ return d.kind==='videoinput'; });
+      var sel=$('selCam');
+      if(cams.length<2){ sel.style.display='none'; return; }
+      var atual=track&&track.getSettings?track.getSettings().deviceId:'';
+      sel.innerHTML='';
+      cams.forEach(function(c,i){
+        var o=document.createElement('option');
+        o.value=c.deviceId;
+        o.textContent=c.label||('Câmera '+(i+1));
+        sel.appendChild(o);
+      });
+      if(atual) sel.value=atual;
+      sel.style.display='';
+    }).catch(function(){});
+  }
+
+  function configZoom(){
+    var wrap=$('zoomWrap'), r=$('zoom');
+    try{
+      var caps=track&&track.getCapabilities?track.getCapabilities():{};
+      if(caps.zoom&&caps.zoom.max>caps.zoom.min){
+        r.min=caps.zoom.min; r.max=caps.zoom.max; r.step=caps.zoom.step||0.1;
+        var st=track.getSettings?track.getSettings():{};
+        r.value=st.zoom||caps.zoom.min;
+        $('zoomVal').textContent=Number(r.value).toFixed(1)+'x';
+        wrap.style.display='';
+        return;
+      }
+    }catch(e){}
+    wrap.style.display='none';
+  }
+
+  $('zoom').oninput=function(){
+    var v=parseFloat(this.value);
+    $('zoomVal').textContent=v.toFixed(1)+'x';
+    if(track&&track.applyConstraints){
+      track.applyConstraints({advanced:[{zoom:v}]}).catch(function(){});
+    }
+  };
+
+  $('selCam').onchange=function(){
+    var id=this.value;
+    paraCam();
+    setTimeout(function(){ ligaCam(id); }, 250);
+  };
+
+  function ligaCam(deviceId){
     if(!navigator.mediaDevices||!navigator.mediaDevices.getUserMedia){
       say('Este navegador não expõe a câmera. Use "Tirar foto".','warn'); return;
     }
     say('Pedindo acesso à câmera…');
-    navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'},width:{ideal:1280}},audio:false})
-    .then(function(s){ stream=s; video.srcObject=s; return video.play(); })
+    var video_c = deviceId
+      ? { deviceId:{exact:deviceId}, width:{ideal:1920}, height:{ideal:1440} }
+      : { facingMode:{ideal:'environment'}, width:{ideal:1920}, height:{ideal:1440} };
+    video_c.advanced=[{focusMode:'continuous'}];
+
+    navigator.mediaDevices.getUserMedia({video:video_c,audio:false})
+    .then(function(s){ stream=s; track=s.getVideoTracks()[0]; video.srcObject=s; return video.play(); })
     .then(function(){
       camwrap.className='camwrap on'; $('btnCam').textContent='Parar câmera';
-      say('Aponte pro QR.'); running=true;
+      $('ctrlCam').style.display='';
+      configZoom(); listaCameras();
+      say('Aponte pro QR. Se não focar, afaste e use o zoom.'); running=true;
       if(!detector&&'BarcodeDetector' in window){
         try{ detector=new window.BarcodeDetector({formats:['qr_code']}); }catch(e){ detector=null; }
       }
@@ -255,6 +324,7 @@
       else say('Não consegui abrir a câmera ('+(n||'erro')+'). Use "Tirar foto".','warn');
     });
   }
+
   function loop(){
     if(!running) return;
     if(video.readyState===video.HAVE_ENOUGH_DATA&&video.videoWidth){
@@ -262,8 +332,14 @@
         detector.detect(video).then(function(c){ if(c&&c.length) achou(String(c[0].rawValue||'').trim()); })
           .catch(function(){ detector=null; });
       } else if(window.jsQR){
-        var w=Math.min(700,video.videoWidth), h=Math.round(video.videoHeight*(w/video.videoWidth));
-        canvas.width=w; canvas.height=h; ctx.drawImage(video,0,0,w,h);
+        alterna++;
+        var vw=video.videoWidth, vh=video.videoHeight;
+        var crop = (alterna%3===0) ? 1 : ((alterna%3===1) ? 0.55 : 0.32);
+        var sw=vw*crop, sh=vh*crop, sx=(vw-sw)/2, sy=(vh-sh)/2;
+        var esc=Math.min(1, 780/Math.max(sw,sh));
+        var w=Math.max(1,Math.round(sw*esc)), h=Math.max(1,Math.round(sh*esc));
+        canvas.width=w; canvas.height=h;
+        ctx.drawImage(video,sx,sy,sw,sh,0,0,w,h);
         try{
           var d=ctx.getImageData(0,0,w,h);
           var c2=window.jsQR(d.data,w,h,{inversionAttempts:'dontInvert'});
@@ -271,7 +347,7 @@
         }catch(e){}
       }
     }
-    setTimeout(function(){ requestAnimationFrame(loop); },100);
+    setTimeout(function(){ requestAnimationFrame(loop); },90);
   }
 
   /* foto */
